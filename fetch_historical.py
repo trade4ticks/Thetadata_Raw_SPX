@@ -14,8 +14,8 @@ What it does:
   5. Splits each response by trading date and writes:
        {DATA_DIR}/{YYYYMMDD_date}/{YYYYMMDD_expiration}/{AM|PM}.parquet
 
-Resume-safe: skips any (expiration, chunk) where the last expected trading day
-already has a parquet file for that expiration+settlement.
+Resume-safe: a chunk is skipped only if parquet files exist for ALL trading
+days in that chunk for that expiration+settlement.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
-import pandas as pd
 from tqdm import tqdm
 
 from config import DATA_DIR
@@ -42,6 +41,11 @@ log = logging.getLogger(__name__)
 
 MAX_WORKERS = 4
 
+# Cache trading day lookups — get_trading_days hits the NYSE calendar and is
+# called once per chunk during task building; cache avoids redundant lookups
+# for chunks that share the same calendar window.
+_trading_day_cache: dict[tuple[date, date], list[date]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,17 +56,26 @@ def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y%m%d").date()
 
 
-def _is_done(td_symbol: str, expiration: str, settlement: str, chunk_start: date, chunk_end: date) -> bool:
+def _get_trading_days(start: date, end: date) -> list[date]:
+    key = (start, end)
+    if key not in _trading_day_cache:
+        _trading_day_cache[key] = get_trading_days(start, end)
+    return _trading_day_cache[key]
+
+
+def _is_done(expiration: str, settlement: str, chunk_start: date, chunk_end: date) -> bool:
     """
-    Skip a chunk if the parquet file already exists for the last trading day
-    in the chunk (indicates a prior complete fetch).
+    A chunk is considered complete only if parquet files exist for ALL
+    trading days in that chunk for the given expiration+settlement.
     """
-    exp_nodash = expiration.replace("-", "")
-    trading_days = get_trading_days(chunk_start, chunk_end)
+    exp_nodash   = expiration.replace("-", "")
+    trading_days = _get_trading_days(chunk_start, chunk_end)
     if not trading_days:
         return True  # no trading days in range, nothing to fetch
-    last_day = trading_days[-1].strftime("%Y%m%d")
-    return exists(last_day, exp_nodash, settlement)
+    return all(
+        exists(day.strftime("%Y%m%d"), exp_nodash, settlement)
+        for day in trading_days
+    )
 
 
 def _fetch_and_write(td_symbol: str, expiration: str, settlement: str,
@@ -165,7 +178,7 @@ def main() -> None:
             continue
 
         for chunk_start, chunk_end in chunk_date_range(start, eff_end, chunk_days=28):
-            if _is_done(td_symbol, expiration, settlement, chunk_start, chunk_end):
+            if _is_done(expiration, settlement, chunk_start, chunk_end):
                 continue
             tasks.append((td_symbol, expiration, settlement, chunk_start, chunk_end))
 

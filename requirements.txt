@@ -3,4 +3,5 @@ pandas
 pyarrow
 python-dotenv
 pandas-market-calendars
+pytz
 tqdm

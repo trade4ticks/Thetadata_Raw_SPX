@@ -40,7 +40,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MAX_WORKERS = 4
+MAX_WORKERS = 2
 _ET_OPEN  = time(9, 35)
 _ET_CLOSE = time(16, 0)
 

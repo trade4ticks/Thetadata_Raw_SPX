@@ -185,6 +185,54 @@ def list_expirations() -> list[dict]:
     return sorted(results, key=lambda r: (r["expiration"], r["settlement"]))
 
 
+def list_active_expirations(trading_day: date) -> list[dict]:
+    """
+    Discover which expirations actually had data on a specific trading day
+    by querying the EOD endpoint with expiration=*.
+
+    Makes two calls (SPXW + SPX), extracts unique expirations from the
+    response, and returns in the same format as list_expirations().
+
+    Returns:
+        [{"td_symbol": "SPXW", "expiration": "2026-01-17", "settlement": "PM"}, ...]
+    """
+    day_str = trading_day.strftime("%Y%m%d")
+    results = []
+    seen = set()
+
+    for td_symbol, settlement in ROOTS.items():
+        params = {
+            "symbol":     td_symbol,
+            "expiration": "*",
+            "start_date": day_str,
+            "end_date":   day_str,
+        }
+        try:
+            data = _get("/v3/option/history/eod", params, timeout=120)
+        except NoDataError:
+            continue
+        except Exception as e:
+            log.warning("EOD lookup failed for %s on %s: %s", td_symbol, day_str, e)
+            continue
+
+        rows = _parse_rows(data)
+        for row in rows:
+            exp = str(row.get("expiration") or "")[:10]
+            if not exp:
+                continue
+            key = (td_symbol, exp)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "td_symbol":  td_symbol,
+                "expiration": exp,
+                "settlement": settlement,
+            })
+
+    return sorted(results, key=lambda r: (r["expiration"], r["settlement"]))
+
+
 # ---------------------------------------------------------------------------
 # History fetch  (with auto-retry on 570 and backoff on 429/474)
 # ---------------------------------------------------------------------------

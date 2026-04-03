@@ -8,10 +8,11 @@ You will be prompted to enter start and end dates (YYYYMMDD).
 
 What it does:
   1. Computes NYSE trading days in the requested range.
-  2. Fetches all available expirations for SPXW (PM) and SPX (AM).
-  3. Builds one task per (trading_day, expiration) pair — each task is a
-     single-day API call for one expiration, all strikes, both rights, 5m bars.
-  4. Runs tasks via ThreadPoolExecutor(2) to stay within ThetaData limits.
+  2. For each trading day, queries the EOD endpoint (expiration=*) to discover
+     which expirations actually had data on that specific day.
+  3. Builds one task per (trading_day, expiration) — only for expirations that
+     existed on that day. No wasted calls on future-dated LEAPS.
+  4. Fetches 5-minute first-order greeks for all strikes via ThreadPoolExecutor(2).
   5. Writes one parquet file per task:
        {DATA_DIR}/{YYYYMMDD_date}/{YYYYMMDD_expiration}/{AM|PM}.parquet
 
@@ -28,7 +29,7 @@ from datetime import date, datetime
 from tqdm import tqdm
 
 from config import DATA_DIR
-from lib.client import fetch_greeks_history, list_expirations, test_connection
+from lib.client import fetch_greeks_history, list_active_expirations, test_connection
 from lib.market_hours import get_trading_days, last_trading_day
 from lib.storage import exists, write
 
@@ -112,71 +113,78 @@ def main() -> None:
         sys.exit(1)
     print("OK")
 
-    # ---- Expirations ----
-    print("Fetching expiration list...", end=" ", flush=True)
-    all_expirations = list_expirations()
-    print(f"{len(all_expirations)} expirations found (SPXW + SPX)")
+    # ---- Process day by day ----
+    grand_total_rows  = 0
+    grand_total_files = 0
+    grand_errors      = 0
 
-    # Pre-parse expiration dates
-    exp_dates = []
-    for e in all_expirations:
-        e["_exp_date"] = datetime.strptime(e["expiration"], "%Y-%m-%d").date()
-        exp_dates.append(e)
+    for day_idx, day in enumerate(trading_days):
+        day_str = day.strftime("%Y%m%d")
+        day_label = f"[{day_idx + 1}/{len(trading_days)}] {day}"
 
-    # ---- Build task list: one task per (trading_day, expiration) ----
-    tasks: list[tuple[str, str, str, date]] = []
-    # (td_symbol, expiration, settlement, trading_day)
+        # Discover which expirations actually existed on this trading day
+        print(f"\n{day_label}  Discovering expirations...", end=" ", flush=True)
+        active = list_active_expirations(day)
+        if not active:
+            print("no expirations found — skipping")
+            continue
 
-    for day in trading_days:
-        # Active expirations for this day: not yet expired
-        active = [e for e in exp_dates if e["_exp_date"] >= day]
+        # Filter to only expirations we haven't already fetched
+        tasks: list[tuple[str, str, str, date]] = []
         for exp_info in active:
-            td_symbol  = exp_info["td_symbol"]
-            expiration = exp_info["expiration"]
-            settlement = exp_info["settlement"]
-            exp_nodash = expiration.replace("-", "")
-            day_str    = day.strftime("%Y%m%d")
+            exp_nodash = exp_info["expiration"].replace("-", "")
+            if not exists(day_str, exp_nodash, exp_info["settlement"]):
+                tasks.append((
+                    exp_info["td_symbol"],
+                    exp_info["expiration"],
+                    exp_info["settlement"],
+                    day,
+                ))
 
-            if exists(day_str, exp_nodash, settlement):
-                continue  # already fetched
+        if not tasks:
+            print(f"{len(active)} expirations — all already fetched")
+            continue
 
-            tasks.append((td_symbol, expiration, settlement, day))
+        print(f"{len(active)} expirations, {len(tasks)} to fetch")
 
-    if not tasks:
-        print("\nAll data already present — nothing to fetch.")
-        return
+        # Fetch greeks for each expiration on this day
+        day_rows  = 0
+        day_files = 0
+        day_errors = 0
 
-    n_days = len({t[3] for t in tasks})
-    n_exps = len({(t[0], t[1]) for t in tasks})
-    print(f"\n{len(tasks)} tasks ({n_days} days × ~{n_exps} expirations, {MAX_WORKERS} workers)\n")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            future_map = {
+                pool.submit(_fetch_and_write, *task): task
+                for task in tasks
+            }
+            with tqdm(total=len(tasks), unit="exp", ncols=90,
+                      desc=f"  {day_str}") as pbar:
+                for future in as_completed(future_map):
+                    task = future_map[future]
+                    td_sym, exp, sett, _ = task
+                    try:
+                        rows = future.result()
+                        day_rows += rows
+                        if rows > 0:
+                            day_files += 1
+                        pbar.set_postfix_str(f"{td_sym} {exp} ({rows}r)")
+                    except Exception as exc:
+                        day_errors += 1
+                        log.warning("FAILED  %s %s %s %s: %s",
+                                    td_sym, exp, sett, day, exc)
+                    finally:
+                        pbar.update(1)
 
-    # ---- Fetch ----
-    total_rows  = 0
-    total_files = 0
-    errors      = 0
+        grand_total_rows  += day_rows
+        grand_total_files += day_files
+        grand_errors      += day_errors
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_map = {
-            pool.submit(_fetch_and_write, *task): task
-            for task in tasks
-        }
-        with tqdm(total=len(tasks), unit="task", ncols=90) as pbar:
-            for future in as_completed(future_map):
-                task = future_map[future]
-                td_sym, exp, sett, day = task
-                try:
-                    rows = future.result()
-                    total_rows += rows
-                    if rows > 0:
-                        total_files += 1
-                    pbar.set_postfix_str(f"{day} {td_sym} {exp} ({rows}r)")
-                except Exception as exc:
-                    errors += 1
-                    log.warning("FAILED  %s %s %s %s: %s", td_sym, exp, sett, day, exc)
-                finally:
-                    pbar.update(1)
+        print(f"  {day_label}  {day_rows:,} rows → {day_files} files"
+              + (f"  ({day_errors} errors)" if day_errors else ""))
 
-    print(f"\nDone. {total_rows:,} rows → {total_files:,} files. {errors} errors.")
+    print(f"\n{'='*60}")
+    print(f"Done. {grand_total_rows:,} rows → {grand_total_files:,} files. "
+          f"{grand_errors} errors across {len(trading_days)} trading days.")
 
 
 if __name__ == "__main__":

@@ -69,6 +69,12 @@ class ServerDisconnectedError(ThetaDataError):
 class LargeRequestError(ThetaDataError):
     """HTTP 570 — request spans too much data; reduce chunk size."""
 
+class TerminalTimeoutError(ThetaDataError):
+    """Read timeout — the terminal accepted the request but never returned."""
+
+class TerminalServerError(ThetaDataError):
+    """HTTP 500 — terminal internal error."""
+
 
 # ---------------------------------------------------------------------------
 # HTTP layer
@@ -88,11 +94,15 @@ def _get(endpoint: str, params: dict, timeout: int = 30) -> dict | list:
     url = f"{THETADATA_BASE_URL}{endpoint}"
     try:
         resp = requests.get(url, params=params, timeout=timeout)
+    except requests.exceptions.ReadTimeout:
+        raise TerminalTimeoutError(f"Read timeout after {timeout}s")
     except requests.exceptions.ConnectionError:
         raise ConnectionError(
             f"Cannot reach ThetaData at {THETADATA_BASE_URL}. "
             "Is Tailscale connected and the Terminal running?"
         )
+    if resp.status_code == 500:
+        raise TerminalServerError(f"HTTP 500: {resp.text[:200]}")
     exc_cls = _STATUS_EXCEPTIONS.get(resp.status_code)
     if exc_cls:
         raise exc_cls(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -242,27 +252,33 @@ def fetch_greeks_history(
     expiration: str,
     start_date: date,
     end_date: date,
-    _chunk_days: int = 28,
+    timeout: int = _BULK_TIMEOUT,
 ) -> pd.DataFrame:
     """
     Fetch 5-minute first-order greeks for one expiration, all strikes.
 
-    Handles:
+    Handles internally:
       - 472 NoData         → returns empty DataFrame (logged at DEBUG)
       - 429 RateLimit      → sleeps 60 s and retries once
       - 474 Disconnected   → sleeps 10 s and retries once
       - 570 LargeRequest   → splits into two half-size chunks and merges
 
+    PROPAGATES (so caller can queue for a retry pass):
+      - TerminalTimeoutError   (read timeout)
+      - TerminalServerError    (HTTP 500)
+      - Any other unexpected exception
+
     Args:
         td_symbol:  "SPXW" or "SPX"
         expiration: "YYYY-MM-DD"
-        start_date / end_date: inclusive date range (caller chunks to ≤28 days)
+        start_date / end_date: inclusive date range
+        timeout: per-request read timeout in seconds (default 300)
 
     Returns:
         DataFrame with columns:
             timestamp, strike, right, settlement,
             bid, ask, delta, theta, vega, rho, implied_vol, underlying_price
-        Empty DataFrame on no-data or unrecoverable error.
+        Empty DataFrame only when server returned no data (NOT on timeout).
     """
     settlement = ROOTS.get(td_symbol.upper(), "PM")
     exp_nodash = expiration.replace("-", "")
@@ -280,7 +296,7 @@ def fetch_greeks_history(
     }
 
     try:
-        data = _get("/v3/option/history/greeks/first_order", params, timeout=_BULK_TIMEOUT)
+        data = _get("/v3/option/history/greeks/first_order", params, timeout=timeout)
 
     except NoDataError:
         log.debug("No data: %s %s %s→%s", td_symbol, expiration, start_date, end_date)
@@ -289,38 +305,28 @@ def fetch_greeks_history(
     except RateLimitError:
         log.warning("Rate limited — sleeping 60s then retrying once")
         time.sleep(60)
-        try:
-            data = _get("/v3/option/history/greeks/first_order", params, timeout=_BULK_TIMEOUT)
-        except Exception as e:
-            log.error("Retry after rate limit failed: %s", e)
-            return pd.DataFrame()
+        data = _get("/v3/option/history/greeks/first_order", params, timeout=timeout)
 
     except ServerDisconnectedError:
         log.warning("Server disconnected — sleeping 10s then retrying once")
         time.sleep(10)
-        try:
-            data = _get("/v3/option/history/greeks/first_order", params, timeout=_BULK_TIMEOUT)
-        except Exception as e:
-            log.error("Retry after disconnect failed: %s", e)
-            return pd.DataFrame()
+        data = _get("/v3/option/history/greeks/first_order", params, timeout=timeout)
 
     except LargeRequestError:
-        # Split into two halves and merge
         mid = start_date + (end_date - start_date) / 2
         log.warning(
             "LargeRequestError: %s %s %s→%s — splitting at %s",
             td_symbol, expiration, start_date, end_date, mid,
         )
-        left  = fetch_greeks_history(td_symbol, expiration, start_date, mid)
-        right = fetch_greeks_history(td_symbol, expiration, mid + timedelta(days=1), end_date)
+        left  = fetch_greeks_history(td_symbol, expiration, start_date, mid, timeout=timeout)
+        right = fetch_greeks_history(
+            td_symbol, expiration, mid + timedelta(days=1), end_date, timeout=timeout
+        )
         if left.empty and right.empty:
             return pd.DataFrame()
         return pd.concat([left, right], ignore_index=True)
 
-    except Exception as e:
-        log.error("Unexpected error fetching %s %s %s→%s: %s",
-                  td_symbol, expiration, start_date, end_date, e)
-        return pd.DataFrame()
+    # TerminalTimeoutError and TerminalServerError intentionally propagate up.
 
     # --- Parse rows ---
     rows = _parse_rows(data)

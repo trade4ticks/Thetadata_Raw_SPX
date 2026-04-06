@@ -28,8 +28,16 @@ from datetime import date, datetime
 
 from tqdm import tqdm
 
+import time
+
 from config import DATA_DIR
-from lib.client import fetch_greeks_history, list_active_expirations, test_connection
+from lib.client import (
+    TerminalServerError,
+    TerminalTimeoutError,
+    fetch_greeks_history,
+    list_active_expirations,
+    test_connection,
+)
 from lib.market_hours import get_trading_days, last_trading_day
 from lib.storage import exists, write
 
@@ -40,7 +48,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MAX_WORKERS = 2
+MAX_WORKERS        = 2
+RETRY_TIMEOUT      = 600   # seconds — longer timeout for the retry pass
+RETRY_COOLDOWN_SEC = 60    # breather before the retry pass starts
 
 
 # ---------------------------------------------------------------------------
@@ -53,12 +63,14 @@ def _parse_date(s: str) -> date:
 
 
 def _fetch_and_write(td_symbol: str, expiration: str, settlement: str,
-                     trading_day: date) -> int:
+                     trading_day: date, timeout: int = 300) -> int:
     """
     Fetch one (trading_day, expiration) and write a single parquet file.
-    Returns rows written.
+    Returns rows written. Raises on timeout/server errors so the caller
+    can queue the expiration for a retry pass.
     """
-    df = fetch_greeks_history(td_symbol, expiration, trading_day, trading_day)
+    df = fetch_greeks_history(td_symbol, expiration, trading_day, trading_day,
+                              timeout=timeout)
     if df.empty:
         return 0
 
@@ -114,9 +126,9 @@ def main() -> None:
     print("OK")
 
     # ---- Process day by day ----
-    grand_total_rows  = 0
-    grand_total_files = 0
-    grand_errors      = 0
+    grand_total_rows     = 0
+    grand_total_files    = 0
+    grand_permanent_fail = 0
 
     for day_idx, day in enumerate(trading_days):
         day_str = day.strftime("%Y%m%d")
@@ -147,10 +159,10 @@ def main() -> None:
 
         print(f"{len(active)} expirations, {len(tasks)} to fetch")
 
-        # Fetch greeks for each expiration on this day
-        day_rows  = 0
-        day_files = 0
-        day_errors = 0
+        # --- Pass 1: parallel fetch with default 300s timeout ---
+        day_rows   = 0
+        day_files  = 0
+        failed: list[tuple[str, str, str, date]] = []
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             future_map = {
@@ -168,23 +180,57 @@ def main() -> None:
                         if rows > 0:
                             day_files += 1
                         pbar.set_postfix_str(f"{td_sym} {exp} ({rows}r)")
+                    except (TerminalTimeoutError, TerminalServerError) as exc:
+                        failed.append(task)
+                        log.warning("TIMEOUT  %s %s %s: %s",
+                                    td_sym, exp, sett, exc)
                     except Exception as exc:
-                        day_errors += 1
-                        log.warning("FAILED  %s %s %s %s: %s",
-                                    td_sym, exp, sett, day, exc)
+                        failed.append(task)
+                        log.warning("FAILED   %s %s %s: %s",
+                                    td_sym, exp, sett, exc)
                     finally:
                         pbar.update(1)
 
+        # --- Pass 2: serial retry with longer timeout ---
+        if failed:
+            print(f"  Pass 2: {len(failed)} expirations failed — cooling down "
+                  f"{RETRY_COOLDOWN_SEC}s before serial retry")
+            time.sleep(RETRY_COOLDOWN_SEC)
+
+            retry_recovered = 0
+            permanent_fail  = 0
+
+            with tqdm(total=len(failed), unit="exp", ncols=90,
+                      desc=f"  {day_str} retry") as pbar:
+                for task in failed:
+                    td_sym, exp, sett, _ = task
+                    try:
+                        rows = _fetch_and_write(*task, timeout=RETRY_TIMEOUT)
+                        day_rows += rows
+                        if rows > 0:
+                            day_files += 1
+                            retry_recovered += 1
+                        pbar.set_postfix_str(f"{td_sym} {exp} ({rows}r)")
+                    except Exception as exc:
+                        permanent_fail += 1
+                        log.error("PERMANENT FAIL  %s %s %s: %s",
+                                  td_sym, exp, sett, exc)
+                    finally:
+                        pbar.update(1)
+
+            grand_permanent_fail += permanent_fail
+            print(f"  Retry: recovered {retry_recovered}/{len(failed)}"
+                  + (f"  ({permanent_fail} permanent failures)" if permanent_fail else ""))
+
         grand_total_rows  += day_rows
         grand_total_files += day_files
-        grand_errors      += day_errors
 
-        print(f"  {day_label}  {day_rows:,} rows → {day_files} files"
-              + (f"  ({day_errors} errors)" if day_errors else ""))
+        print(f"  {day_label}  {day_rows:,} rows → {day_files} files")
 
     print(f"\n{'='*60}")
     print(f"Done. {grand_total_rows:,} rows → {grand_total_files:,} files. "
-          f"{grand_errors} errors across {len(trading_days)} trading days.")
+          f"{grand_permanent_fail} permanent failures across "
+          f"{len(trading_days)} trading days.")
 
 
 if __name__ == "__main__":

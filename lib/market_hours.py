@@ -17,6 +17,9 @@ _NYSE = mcal.get_calendar("NYSE")
 # Market open/close in ET
 _OPEN_TIME  = time(9, 35)   # skip the erroneous 9:30 bar
 _CLOSE_TIME = time(16, 0)
+# Grace window after the close so post-close cron runs can still sweep any
+# trailing 5-min bars (15:55, 16:00) and backfill gaps from earlier in the day.
+_INTRADAY_GATE_CLOSE = time(17, 0)
 
 
 def now_et() -> datetime:
@@ -31,8 +34,14 @@ def is_trading_day(d: date) -> bool:
     return not schedule.empty
 
 
-def is_market_open(dt: datetime | None = None) -> bool:
-    """Return True if dt (default: now) is within 9:35–16:00 ET on a trading day."""
+def is_market_open(dt: datetime | None = None, *, grace: bool = True) -> bool:
+    """Return True if dt (default: now) is within the intraday-fetch window on a trading day.
+
+    With grace=True (default) the window is 9:35–17:00 ET so cron runs after the
+    close can still pull the 15:55 and 16:00 bars (which publish ~1 minute late)
+    and backfill any earlier gaps.
+    With grace=False the window is the strict 9:35–16:00 ET trading session.
+    """
     if dt is None:
         dt = now_et()
     elif dt.tzinfo is None:
@@ -43,7 +52,8 @@ def is_market_open(dt: datetime | None = None) -> bool:
     if not is_trading_day(dt.date()):
         return False
     t = dt.time()
-    return _OPEN_TIME <= t <= _CLOSE_TIME
+    end = _INTRADAY_GATE_CLOSE if grace else _CLOSE_TIME
+    return _OPEN_TIME <= t <= end
 
 
 def get_trading_days(start: date, end: date) -> list[date]:

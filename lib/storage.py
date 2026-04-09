@@ -73,12 +73,29 @@ def read(trading_date: str, expiration: str, settlement: str) -> pd.DataFrame:
 
 
 def write(trading_date: str, expiration: str, settlement: str, df: pd.DataFrame) -> None:
-    """Write df to parquet, overwriting any existing file for this (date, exp, settlement)."""
+    """Write df to parquet, overwriting any existing file for this (date, exp, settlement).
+
+    Enforces the raw _SCHEMA on the core columns but preserves any extra columns
+    (e.g. dte, intrinsic, extrinsic, flags added by downstream cleaning) by letting
+    pyarrow infer their types.
+    """
     if df.empty:
         return
     p = _path(trading_date, expiration, settlement)
     p.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pandas(df[list(_SCHEMA.names)], schema=_SCHEMA, preserve_index=False)
+
+    extra_cols = [c for c in df.columns if c not in _SCHEMA.names]
+    ordered = df[list(_SCHEMA.names) + extra_cols]
+
+    if extra_cols:
+        # Build a schema that pins core columns and lets pyarrow infer the rest.
+        inferred = pa.Schema.from_pandas(ordered, preserve_index=False)
+        fields = list(_SCHEMA) + [inferred.field(c) for c in extra_cols]
+        schema = pa.schema(fields)
+    else:
+        schema = _SCHEMA
+
+    table = pa.Table.from_pandas(ordered, schema=schema, preserve_index=False)
     pq.write_table(table, p, compression="snappy")
 
 

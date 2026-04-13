@@ -21,6 +21,12 @@ STEPS = [
         "cwd": "/interpolate_SPX",
         "log": "/interpolate_SPX/logs/process_intraday.log",
     },
+    {
+        "name": "surface_snapshot",
+        "cmd": ["/spx_surface_snapshot/.venv/bin/python", "/spx_surface_snapshot/scripts/process_intraday.py"],
+        "cwd": "/spx_surface_snapshot",
+        "log": "/spx_surface_snapshot/logs/process_intraday.log",
+    },
 ]
 
 def log(msg: str) -> None:

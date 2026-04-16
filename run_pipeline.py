@@ -4,6 +4,12 @@ from datetime import datetime
 
 STEPS = [
     {
+        "name": "update_index_ohlc",
+        "cmd": ["/Thetadata_Raw_SPX/.venv/bin/python", "/Thetadata_Raw_SPX/update_index_ohlc.py"],
+        "cwd": "/Thetadata_Raw_SPX",
+        "log": "/Thetadata_Raw_SPX/logs/update_index_ohlc.log",
+    },
+    {
         "name": "fetch_intraday",
         "cmd": ["/Thetadata_Raw_SPX/.venv/bin/python", "/Thetadata_Raw_SPX/fetch_intraday.py"],
         "cwd": "/Thetadata_Raw_SPX",

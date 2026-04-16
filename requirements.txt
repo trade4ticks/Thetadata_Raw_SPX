@@ -5,3 +5,5 @@ python-dotenv
 pandas-market-calendars
 pytz
 tqdm
+psycopg2-binary
+yfinance

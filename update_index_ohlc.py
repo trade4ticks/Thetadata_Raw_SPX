@@ -127,8 +127,15 @@ def upsert_to_pg(conn: psycopg2.extensions.connection, wide: pd.DataFrame) -> in
             wide[c] = None
     wide = wide[PG_COLS]
 
-    col_list   = ", ".join(PG_COLS)
-    update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in OHLC_COLS)
+    col_list = ", ".join(PG_COLS)
+    # Only overwrite a column when the incoming value is non-NULL. Yahoo
+    # publishes VIX3M/VIX9D a bar or two behind SPX, so recent rows often
+    # arrive with some OHLC cols still NaN. Without COALESCE a later run
+    # that happens to return NaN (yfinance hiccup, revision, etc.) would
+    # erase a value we already stored — this makes backfill monotonic.
+    update_set = ", ".join(
+        f"{c} = COALESCE(EXCLUDED.{c}, {PG_TABLE}.{c})" for c in OHLC_COLS
+    )
     sql = f"""
         INSERT INTO {PG_TABLE} ({col_list})
         VALUES %s

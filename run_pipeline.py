@@ -33,6 +33,12 @@ STEPS = [
         "cwd": "/spx_surface_snapshot",
         "log": "/spx_surface_snapshot/logs/process_intraday.log",
     },
+    {
+        "name": "surface_snapshot_followup",
+        "cmd": ["/spx_surface_snapshot/.venv/bin/python", "/spx_surface_snapshot/scripts/process_intraday_followup.py"],
+        "cwd": "/spx_surface_snapshot",
+        "log": "/spx_surface_snapshot/logs/process_intraday_followup.log",
+    },
 ]
 
 def log(msg: str) -> None:
